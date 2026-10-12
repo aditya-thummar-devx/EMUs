@@ -51,12 +51,22 @@ final class EmulatorManager: ObservableObject {
     
     // MARK: - Detect Paths (nonisolated)
     private nonisolated static func findEmulatorBinary() -> String? {
+        let env = ProcessInfo.processInfo.environment
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let possiblePaths = [
+        var possiblePaths: [String] = []
+        
+        if let androidHome = env["ANDROID_HOME"], !androidHome.isEmpty {
+            possiblePaths.append("\(androidHome)/emulator/emulator")
+        }
+        if let androidSdkRoot = env["ANDROID_SDK_ROOT"], !androidSdkRoot.isEmpty {
+            possiblePaths.append("\(androidSdkRoot)/emulator/emulator")
+        }
+        
+        possiblePaths.append(contentsOf: [
             "\(home)/Library/Android/sdk/emulator/emulator",
             "/opt/homebrew/bin/emulator",
             "/usr/local/bin/emulator"
-        ]
+        ])
         
         for path in possiblePaths {
             if FileManager.default.fileExists(atPath: path) {
@@ -72,12 +82,22 @@ final class EmulatorManager: ObservableObject {
     }
     
     private nonisolated static func findAdbBinary() -> String? {
+        let env = ProcessInfo.processInfo.environment
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let possiblePaths = [
+        var possiblePaths: [String] = []
+        
+        if let androidHome = env["ANDROID_HOME"], !androidHome.isEmpty {
+            possiblePaths.append("\(androidHome)/platform-tools/adb")
+        }
+        if let androidSdkRoot = env["ANDROID_SDK_ROOT"], !androidSdkRoot.isEmpty {
+            possiblePaths.append("\(androidSdkRoot)/platform-tools/adb")
+        }
+        
+        possiblePaths.append(contentsOf: [
             "\(home)/Library/Android/sdk/platform-tools/adb",
             "/opt/homebrew/bin/adb",
             "/usr/local/bin/adb"
-        ]
+        ])
         
         for path in possiblePaths {
             if FileManager.default.fileExists(atPath: path) {

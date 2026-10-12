@@ -24,7 +24,7 @@ A native macOS menu bar manager for system emulators and simulators (Android AVD
 Run the build script to compile and generate `EMUs.dmg`:
 
 ```bash
-cd /Users/aditya/Documents/learnings/EMUs
+cd EMUs
 ./build_dmg.sh
 ```
 

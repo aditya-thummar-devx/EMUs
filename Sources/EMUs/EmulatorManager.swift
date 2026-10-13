@@ -5,6 +5,33 @@ enum EmulatorPlatform: String, Codable {
     case ios = "iOS"
 }
 
+// MARK: - Wireless Device Model
+enum WirelessConnectionState {
+    case connected
+    case disconnected
+    case unavailable
+}
+
+struct WirelessDevice: Identifiable, Equatable {
+    var id: String { serial ?? name }
+    let name: String
+    let platform: EmulatorPlatform
+    let model: String?
+    let osVersion: String?
+    let serial: String?
+    let connectionState: WirelessConnectionState
+
+    static func == (lhs: WirelessDevice, rhs: WirelessDevice) -> Bool {
+        lhs.id == rhs.id
+    }
+}
+
+// MARK: - Tunnel Result
+struct TunnelResult {
+    let success: Bool
+    let error: String?
+}
+
 enum EmulatorStatus: Equatable {
     case stopped
     case running(portOrId: String)
@@ -26,6 +53,9 @@ final class EmulatorManager: ObservableObject {
     @Published var emulators: [EmulatorDevice] = []
     @Published var isLoading: Bool = false
     @Published var errorMessage: String? = nil
+
+    @Published var wirelessDevices: [WirelessDevice] = []
+    @Published var isLoadingWireless: Bool = false
     
     private var refreshTimer: Timer?
     
@@ -303,7 +333,133 @@ final class EmulatorManager: ObservableObject {
             await self.updateRunningStatuses()
         }
     }
-    
+
+    // MARK: - Wireless Devices
+    func fetchWirelessDevices() async {
+        isLoadingWireless = true
+        var list: [WirelessDevice] = []
+
+        await Task.detached(priority: .userInitiated) {
+            // ── Android: adb devices -l, pick entries with _adb-tls-connect (wireless)
+            // or plain IP:port entries (manual adb connect)
+            let adbBin = Self.findAdbBinary()
+            if let adb = adbBin {
+                let output = Self.runProcess(executable: adb, arguments: ["devices", "-l"])
+                let lines = output.components(separatedBy: .newlines)
+                for line in lines {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    guard !trimmed.isEmpty,
+                          !trimmed.hasPrefix("List of devices"),
+                          !trimmed.hasPrefix("emulator-") else { continue }
+
+                    // Wireless = serial contains _adb-tls-connect OR matches IP:port pattern
+                    let isWirelessTls  = trimmed.contains("_adb-tls-connect")
+                    let isIpConnect    = trimmed.first?.isNumber == true && trimmed.contains(".")
+                    guard isWirelessTls || isIpConnect else { continue }
+
+                    let parts = trimmed.components(separatedBy: .whitespaces)
+                    guard let serial = parts.first,
+                          parts.contains("device") else { continue }
+
+                    // Read device props
+                    let model   = Self.runProcess(executable: adb, arguments: ["-s", serial, "shell", "getprop", "ro.product.model"])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let brand   = Self.runProcess(executable: adb, arguments: ["-s", serial, "shell", "getprop", "ro.product.brand"])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let android = Self.runProcess(executable: adb, arguments: ["-s", serial, "shell", "getprop", "ro.build.version.release"])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                    let displayName = model.isEmpty ? serial : model
+                    let fullModel   = brand.isEmpty ? nil : "\(brand.capitalized) \(model)"
+                    let osString    = android.isEmpty ? nil : "Android \(android)"
+
+                    list.append(WirelessDevice(
+                        name: displayName,
+                        platform: .android,
+                        model: fullModel,
+                        osVersion: osString,
+                        serial: serial,
+                        connectionState: .connected
+                    ))
+                }
+            }
+
+            // ── iOS: xcrun devicectl list devices --json-output
+            let tmpFile = FileManager.default.temporaryDirectory
+                .appendingPathComponent("emu_devicectl_\(UUID().uuidString).json").path
+            _ = Self.runShellCommand("xcrun devicectl list devices --json-output \(tmpFile) 2>/dev/null")
+
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: tmpFile)),
+               let json  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let result = json["result"] as? [String: Any],
+               let devices = result["devices"] as? [[String: Any]] {
+
+                for device in devices {
+                    let cp  = device["connectionProperties"] as? [String: Any] ?? [:]
+                    let dp  = device["deviceProperties"]    as? [String: Any] ?? [:]
+                    let hp  = device["hardwareProperties"]  as? [String: Any] ?? [:]
+
+                    guard let platform = hp["platform"] as? String, platform == "iOS" else { continue }
+
+                    let name        = dp["name"]          as? String ?? "Unknown Device"
+                    let marketing   = hp["marketingName"] as? String
+                    let osVersion   = dp["osVersionNumber"] as? String
+                    let udid        = hp["udid"]          as? String
+                    let tunnelState = cp["tunnelState"]   as? String ?? "unavailable"
+
+                    let connState: WirelessConnectionState
+                    switch tunnelState.lowercased() {
+                    case "connected":    connState = .connected
+                    case "disconnected": connState = .disconnected
+                    default:             connState = .unavailable
+                    }
+
+                    list.append(WirelessDevice(
+                        name: name,
+                        platform: .ios,
+                        model: marketing,
+                        osVersion: osVersion.map { "iOS \($0)" },
+                        serial: udid,
+                        connectionState: connState
+                    ))
+                }
+            }
+            try? FileManager.default.removeItem(atPath: tmpFile)
+        }.value
+
+        self.wirelessDevices = list
+        self.isLoadingWireless = false
+    }
+
+    // MARK: - ADB Reverse Tunnel
+    func runAdbReverse(devicePort: String, hostPort: String) async -> TunnelResult {
+        return await Task.detached(priority: .userInitiated) {
+            guard let adb = Self.findAdbBinary() else {
+                return TunnelResult(success: false, error: "adb not found")
+            }
+            let process = Process()
+            let outPipe  = Pipe()
+            let errPipe  = Pipe()
+            process.executableURL = URL(fileURLWithPath: adb)
+            process.arguments    = ["reverse", "tcp:\(devicePort)", "tcp:\(hostPort)"]
+            process.standardOutput = outPipe
+            process.standardError  = errPipe
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                let errStr  = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if process.terminationStatus == 0 {
+                    return TunnelResult(success: true, error: nil)
+                } else {
+                    return TunnelResult(success: false, error: errStr.isEmpty ? "Exit code \(process.terminationStatus)" : errStr)
+                }
+            } catch {
+                return TunnelResult(success: false, error: error.localizedDescription)
+            }
+        }.value
+    }
+
     // MARK: - Helper Methods
     private nonisolated static func getRunningAndroidAvds(adbPath: String?) -> [(serial: String, avdName: String)] {
         guard let adb = adbPath else { return [] }
